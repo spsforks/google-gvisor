@@ -739,7 +739,7 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 }
 
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pagesFile *fd.FD, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pagesFile *fd.FD, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, saveNetworkStack bool) error {
 	loadStart := time.Now()
 
 	var (
@@ -802,9 +802,13 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pages
 		return mfLoadErr
 	}
 
-	// rootNetworkNamespace should be populated after loading the state file.
-	// Restore the root network stack.
-	k.rootNetworkNamespace.RestoreRootStack(net)
+	if !saveNetworkStack {
+		// rootNetworkNamespace and stack should be populated after
+		// loading the state file. Reset the stack before restoring the
+		// root network stack.
+		k.rootNetworkNamespace.ResetStack()
+		k.rootNetworkNamespace.RestoreRootStack(net)
+	}
 
 	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
 

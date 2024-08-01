@@ -42,9 +42,9 @@ type AddressableEndpointState struct {
 	//   addressState.mu
 	mu addressableEndpointStateRWMutex `state:"nosave"`
 	// +checklocks:mu
-	endpoints map[tcpip.Address]*addressState
+	endpoints map[tcpip.Address]*addressState `state:"nosave"`
 	// +checklocks:mu
-	primary []*addressState
+	primary []*addressState `state:"nosave"`
 }
 
 // AddressableEndpointStateOptions contains options used to configure an
