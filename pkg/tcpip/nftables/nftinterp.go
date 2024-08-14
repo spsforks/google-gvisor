@@ -108,7 +108,7 @@ func InterpretRule(ruleString string) (*Rule, error) {
 		return s == ""
 	})
 
-	r := &Rule{ops: make([]Operation, 0, len(lines))}
+	r := &Rule{ops: make([]operation, 0, len(lines))}
 
 	// Interprets all operations in the rule.
 	for lnIdx, line := range lines {
@@ -116,7 +116,9 @@ func InterpretRule(ruleString string) (*Rule, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.AddOperation(op)
+		if err := r.addOperation(op); err != nil {
+			return nil, err
+		}
 	}
 
 	return r, nil
@@ -126,7 +128,7 @@ func InterpretRule(ruleString string) (*Rule, error) {
 // assumed to be a single line of text surrounded in square brackets.
 // Note: the operation string should be generated as output from the official nft
 // binary (can be accomplished by using flag --debug=netlink).
-func InterpretOperation(line string, lnIdx int) (Operation, error) {
+func InterpretOperation(line string, lnIdx int) (operation, error) {
 	tokens := strings.Fields(line)
 	if len(tokens) < 2 {
 		return nil, &SyntaxError{lnIdx, 0, fmt.Sprintf("incorrect number of tokens for operation, should be at least 2, got %d", len(tokens))}
@@ -136,13 +138,15 @@ func InterpretOperation(line string, lnIdx int) (Operation, error) {
 	switch tokens[1] {
 	case "immediate":
 		return InterpretImmediate(line, lnIdx)
+	case "cmp":
+		return InterpretComparison(line, lnIdx)
 	default:
 		return nil, &SyntaxError{lnIdx, 1, fmt.Sprintf("unrecognized operation type: %s", tokens[1])}
 	}
 }
 
 // InterpretImmediate creates a new Immediate operation from the given string.
-func InterpretImmediate(line string, lnIdx int) (Operation, error) {
+func InterpretImmediate(line string, lnIdx int) (operation, error) {
 	tokens := strings.Fields(line)
 
 	// Requires at least 6 tokens:
@@ -189,12 +193,75 @@ func InterpretImmediate(line string, lnIdx int) (Operation, error) {
 	}
 
 	// Create the operation with the specified arguments.
-	imm, err := NewImmediate(reg, data)
+	imm, err := newImmediate(reg, data)
 	if err != nil {
 		return nil, &LogicError{lnIdx, tkIdx, err}
 	}
 
 	return imm, nil
+}
+
+// InterpretComparison creates a new Comparison operation from the given string.
+func InterpretComparison(line string, lnIdx int) (operation, error) {
+	tokens := strings.Fields(line)
+
+	// Requires at least 7 tokens:
+	// 		"[", "cmp", op, "reg", register index, register value, "]".
+	if len(tokens) < 7 {
+		return nil, &SyntaxError{lnIdx, 0, fmt.Sprintf("incorrect number of tokens for cmp operation, should be at least 7, got %d", len(tokens))}
+	}
+
+	if err := checkOperationBrackets(tokens, lnIdx); err != nil {
+		return nil, err
+	}
+
+	tkIdx := 1
+
+	// First token should be "cmp".
+	if err := consumeToken("cmp", tokens, lnIdx, tkIdx); err != nil {
+		return nil, err
+	}
+	tkIdx++
+
+	// Second token should be the comparison operator.
+	cop, err := parseCmpOp(tokens[tkIdx], lnIdx, tkIdx)
+	if err != nil {
+		return nil, err
+	}
+	tkIdx++
+
+	// Third token should be "reg".
+	if err := consumeToken("reg", tokens, lnIdx, tkIdx); err != nil {
+		return nil, err
+	}
+	tkIdx++
+
+	// Fourth token should be the uint8 representing the register index.
+	reg, err := parseRegister(tokens[tkIdx], lnIdx, tkIdx)
+	if err != nil {
+		return nil, err
+	}
+	tkIdx++
+
+	// Fifth token should be the value.
+	nextIdx, data, err := parseRegisterData(reg, tokens, lnIdx, tkIdx)
+	if err != nil {
+		return nil, err
+	}
+	tkIdx = nextIdx
+
+	// Done parsing tokens.
+	if tkIdx != len(tokens)-1 {
+		return nil, &SyntaxError{lnIdx, tkIdx, "unexpected token after comparison operation"}
+	}
+
+	// Create the operation with the specified arguments.
+	cmp, err := newComparison(reg, cop, data)
+	if err != nil {
+		return nil, &LogicError{lnIdx, tkIdx, err}
+	}
+
+	return cmp, nil
 }
 
 //
@@ -230,24 +297,24 @@ func parseRegister(regString string, lnIdx int, tkIdx int) (uint8, error) {
 // parseRegisterData parses the register data from the given token and returns
 // the index of the next token to process (can consume multiple tokens).
 // Note: assumes the register index is valid (was checked in parseRegister).
-func parseRegisterData(reg uint8, tokens []string, lnIdx int, tkIdx int) (int, RegisterData, error) {
+func parseRegisterData(reg uint8, tokens []string, lnIdx int, tkIdx int) (int, registerData, error) {
 	// Handles verdict data.
 	if isVerdictRegister(reg) {
 		nextIdx, verdict, err := parseVerdict(tokens, lnIdx, tkIdx)
 		if err != nil {
 			return 0, nil, err
 		}
-		return nextIdx, NewVerdictData(verdict), nil
+		return nextIdx, newVerdictData(verdict), nil
 	}
-	// Handles hex data (4- or 16-byte).
+	// Handles hex data (4-, 8-, 12-, or 16-byte).
 	if len(tokens[tkIdx]) > 1 && tokens[tkIdx][:2] == "0x" {
 		nextIdx, data, err := parseHexData(tokens, lnIdx, tkIdx)
 		if err != nil {
 			return 0, nil, err
 		}
-		// Validates the register data type. 4-byte data is valid for both 4- and
-		// 16-byte registers, but 16-byte data is only valid for 16-byte registers.
-		if err := data.ValidateRegister(reg); err != nil {
+		// 4-byte data is only valid for 4-byte register. Any byte data can be
+		// stored in 16-byte registerValidates the register data type.
+		if err := data.validateRegister(reg); err != nil {
 			return 0, nil, &LogicError{lnIdx, tkIdx, err}
 		}
 		return nextIdx, data, nil
@@ -300,7 +367,7 @@ func parseVerdict(tokens []string, lnIdx int, tkIdx int) (int, Verdict, error) {
 
 // parseHexData parses little endian hexadecimal data from the given token and
 // returns the index of the next token to process (can consume multiple tokens).
-func parseHexData(tokens []string, lnIdx int, tkIdx int) (int, RegisterData, error) {
+func parseHexData(tokens []string, lnIdx int, tkIdx int) (int, registerData, error) {
 	var bytes []byte
 	for ; tkIdx < len(tokens); tkIdx++ {
 		if len(tokens[tkIdx]) < 2 || tokens[tkIdx][:2] != "0x" {
@@ -318,10 +385,30 @@ func parseHexData(tokens []string, lnIdx int, tkIdx int) (int, RegisterData, err
 		}
 		bytes = append(bytes, bytes4...)
 	}
-	if len(bytes) == 4 || len(bytes) == 16 {
-		return tkIdx, NewBytesData(bytes), nil
+	if len(bytes) > 16 {
+		return 0, nil, &SyntaxError{lnIdx, tkIdx, fmt.Sprintf("cannot have more than 16 bytes of hexadecimal data, got %d", len(bytes))}
 	}
-	return 0, nil, &SyntaxError{lnIdx, tkIdx, fmt.Sprintf("incorrect number of bytes for hexadecimal data, should be 4 or 16, got %d", len(bytes))}
+	return tkIdx, newBytesData(bytes), nil
+}
+
+// parseCmpOp parses the int representing the cmpOp from the given string.
+func parseCmpOp(copString string, lnIdx int, tkIdx int) (int, error) {
+	switch copString {
+	case "eq":
+		return linux.NFT_CMP_EQ, nil
+	case "neq":
+		return linux.NFT_CMP_NEQ, nil
+	case "lt":
+		return linux.NFT_CMP_LT, nil
+	case "lte":
+		return linux.NFT_CMP_LTE, nil
+	case "gt":
+		return linux.NFT_CMP_GT, nil
+	case "gte":
+		return linux.NFT_CMP_GTE, nil
+	default:
+		return 0, &SyntaxError{lnIdx, tkIdx, fmt.Sprintf("invalid comparison operator: '%s'", copString)}
+	}
 }
 
 // consumeToken is a helper function that checks if the token at the given index
