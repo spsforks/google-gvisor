@@ -211,34 +211,41 @@ type Loader struct {
 	// mu guards the fields below.
 	mu sync.Mutex
 
-	// state is guarded by mu.
+	// +checklocks:mu
 	state loaderState
 
 	// sharedMounts holds VFS mounts that may be shared between containers within
 	// the same pod. It is mapped by mount source.
 	//
-	// sharedMounts is guarded by mu.
+	// +checklocks:mu
 	sharedMounts map[string]*vfs.Mount
 
 	// processes maps containers init process and invocation of exec. Root
 	// processes are keyed with container ID and pid=0, while exec invocations
 	// have the corresponding pid set.
 	//
-	// processes is guarded by mu.
+	// +checklocks:mu
 	processes map[execID]*execProcess
 
 	// containerIDs store container names and IDs to assist with restore and container
 	// naming when user didn't provide one.
 	//
 	// Mapping: name -> cid.
-	// processes is guarded by mu.
+	// +checklocks:mu
 	containerIDs map[string]string
+
+	// containerSpecs stores container specs for each container in sandbox.
+	//
+	// Mapping: cid -> spec.
+	// +checklocks:mu
+	containerSpecs map[string]*specs.Spec
 
 	// portForwardProxies is a list of active port forwarding connections.
 	//
-	// portForwardProxies is guarded by mu.
+	// +checklocks:mu
 	portForwardProxies []*pf.Proxy
 
+	// +checklocks:mu
 	saveFDs []*fd.FD
 }
 
@@ -412,17 +419,18 @@ func New(args Args) (*Loader, error) {
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		sandboxID:     args.ID,
-		processes:     map[execID]*execProcess{eid: {}},
-		sharedMounts:  make(map[string]*vfs.Mount),
-		stopProfiling: stopProfiling,
-		productName:   args.ProductName,
-		hostShmemHuge: args.HostShmemHuge,
-		containerIDs:  map[string]string{},
-		saveFDs:       args.SaveFDs,
+		sandboxID:      args.ID,
+		processes:      map[execID]*execProcess{eid: {}},
+		sharedMounts:   make(map[string]*vfs.Mount),
+		stopProfiling:  stopProfiling,
+		productName:    args.ProductName,
+		hostShmemHuge:  args.HostShmemHuge,
+		containerIDs:   make(map[string]string),
+		containerSpecs: make(map[string]*specs.Spec),
+		saveFDs:        args.SaveFDs,
 	}
 
-	containerName := l.registerContainerLocked(args.Spec, args.ID)
+	containerName := l.registerContainer(args.Spec, args.ID)
 	l.root = containerInfo{
 		cid:                 args.ID,
 		containerName:       containerName,
@@ -698,9 +706,11 @@ func (l *Loader) Destroy() {
 	l.watchdog.Stop()
 
 	ctx := l.k.SupervisorContext()
+	l.mu.Lock()
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
 	}
+	l.mu.Unlock()
 
 	// Stop the control server. This will indirectly stop any
 	// long-running control operations that are in flight, e.g.
@@ -1666,7 +1676,8 @@ func (l *Loader) threadGroupFromID(key execID) (*kernel.ThreadGroup, error) {
 // tryThreadGroupFromIDLocked returns the thread group for the given execution
 // ID. It may return nil in case the container has not started yet. Returns
 // error if execution ID is invalid or if the container cannot be found (maybe
-// it has been deleted). Caller must hold 'mu'.
+// it has been deleted).
+// +checklocks:l.mu
 func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, error) {
 	ep, err := l.findProcessLocked(key)
 	if err != nil {
@@ -1678,7 +1689,8 @@ func (l *Loader) tryThreadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, er
 // ttyFromIDLocked returns the TTY files for the given execution ID. It may
 // return nil in case the container has not started yet. Returns error if
 // execution ID is invalid or if the container cannot be found (maybe it has
-// been deleted). Caller must hold 'mu'.
+// been deleted).
+// +checklocks:l.mu
 func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileDescription, error) {
 	ep, err := l.findProcessLocked(key)
 	if err != nil {
@@ -1861,6 +1873,7 @@ func (l *Loader) networkStats() ([]*NetworkInterface, error) {
 	return stats, nil
 }
 
+// +checklocks:l.mu
 func (l *Loader) findProcessLocked(key execID) (*execProcess, error) {
 	ep := l.processes[key]
 	if ep == nil {
@@ -1876,6 +1889,7 @@ func (l *Loader) registerContainer(spec *specs.Spec, cid string) string {
 	return l.registerContainerLocked(spec, cid)
 }
 
+// +checklocks:l.mu
 func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
 	containerName := specutils.ContainerName(spec)
 	if len(containerName) == 0 {
@@ -1885,7 +1899,14 @@ func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
 	}
 
 	l.containerIDs[containerName] = cid
+	l.containerSpecs[cid] = spec
 	return containerName
+}
+
+func (l *Loader) getContainerSpec(cid string) *specs.Spec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.containerSpecs[cid]
 }
 
 func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
